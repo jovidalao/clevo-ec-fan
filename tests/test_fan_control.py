@@ -7,11 +7,13 @@ import tkinter as tk
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from app_config import AppConfig
-from clevo_fan import DEFAULT_CURVE, interpolate
+from clevo_fan import DEFAULT_CURVE, FanController, interpolate
 from fan_policy import FanPolicy, MODE_NAMES
 from clevo_fan_gui import FanControlApp, controller_worker
+from telemetry_history import TelemetryHistory, HISTORY_RANGES
 
 
 class FakeController:
@@ -33,7 +35,7 @@ class FakeController:
             raise RuntimeError("sensor failed")
         return self.temperatures[fan], 50
 
-    def status(self):
+    def status(self, **kwargs):
         return {"fans": [{"fan": fan, "temperature_c": temp, "duty_percent": 50, "rpm": 2000}
                          for fan, temp in self.temperatures.items()]}
 
@@ -87,6 +89,93 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.curves()[1], config.curves()[2])
         config.data["link_curves"] = False
         self.assertNotEqual(config.curves()[1], config.curves()[2])
+
+    def test_history_range_survives_reopen_and_invalid_value_is_defaulted(self):
+        for name in HISTORY_RANGES:
+            config = self.load({"history_range": name})
+            config.save()
+            self.assertEqual(AppConfig.load(self.path).data["history_range"], name)
+        self.assertEqual(self.load({"history_range": "invalid"}).data["history_range"], "15 分钟")
+
+
+class HistoryTests(unittest.TestCase):
+    def test_keeps_more_than_three_minutes_and_prunes_by_time(self):
+        history = TelemetryHistory()
+        for timestamp in range(0, 1200, 2):
+            history.append(timestamp, [{"fan": 1, "temperature_c": 50}])
+        self.assertEqual(len(history.fans[1]), 600)
+        history.append(90000, [{"fan": 2, "temperature_c": 40}])
+        self.assertEqual(len(history.fans[1]), 0)
+
+    def test_downsampling_preserves_hot_and_cold_peaks_in_time_order(self):
+        history = TelemetryHistory()
+        for timestamp, value in ((1, 40), (2, 99), (3, 20), (4, 42)):
+            history.append(timestamp, [{"fan": 1, "temperature_c": value}])
+        self.assertEqual(history.segments(1, "temperature_c", 10, 10, 1),
+                         [[(1, 40), (2, 99), (3, 20), (4, 42)]])
+
+    def test_missing_rpm_and_communication_gaps_are_not_connected(self):
+        history = TelemetryHistory()
+        for timestamp, rpm in ((0, 2000), (2, 2200), (4, None), (6, 2300), (8, 2400), (30, 2500)):
+            history.append(timestamp, [{"fan": 1, "rpm": rpm}])
+        self.assertEqual(history.segments(1, "rpm", 30, 40, 100),
+                         [[(0, 2000), (2, 2200)], [(6, 2300), (8, 2400)], [(30, 2500)]])
+
+    def test_dense_history_has_bounded_drawing_cost(self):
+        history = TelemetryHistory()
+        for index in range(2000):
+            history.append(index / 100, [{"fan": 1, "temperature_c": index % 100}])
+        segments = history.segments(1, "temperature_c", 20, 20, 20)
+        self.assertLessEqual(sum(map(len, segments)), 80)
+        self.assertEqual(max(value for segment in segments for _, value in segment), 99)
+
+
+class MonitorTests(unittest.TestCase):
+    def test_rpm_timeout_does_not_fail_temperature_and_cached_sample_is_reused(self):
+        controller = FanController.__new__(FanController)
+        controller.fan_count = 2
+        controller.read_temperature_and_duty = Mock(side_effect=AssertionError("duplicate temperature read"))
+        controller.ec = Mock()
+        controller.ec.read_rpm.side_effect = [TimeoutError("RPM timeout"), 2400, 2100, 2500]
+        readings = {1: (60, 40), 2: (45, 30)}
+        status = controller.status(readings, tolerate_rpm_errors=True)
+        self.assertIsNone(status["fans"][0]["rpm"])
+        self.assertEqual(status["fans"][0]["temperature_c"], 60)
+        self.assertTrue(status["warnings"])
+        controller.status(readings, tolerate_rpm_errors=True, read_rpm=False)
+        self.assertEqual(controller.ec.read_rpm.call_count, 2)
+        recovered = controller.status(readings, tolerate_rpm_errors=True)
+        self.assertFalse(recovered["warnings"])
+        self.assertEqual(recovered["fans"][0]["rpm"], 2100)
+        controller.read_temperature_and_duty.assert_not_called()
+
+    def test_monitor_failure_does_not_reset_curve(self):
+        controller = FakeController()
+        commands, events = queue.Queue(), queue.Queue()
+        commands.put(("configure", settings("curve", "manual")))
+
+        def fail_monitor(**kwargs):
+            commands.put(("shutdown", None))
+            raise TimeoutError("monitor only")
+
+        controller.status = fail_monitor
+        with patch("clevo_fan_gui.FanController", return_value=controller):
+            controller_worker(commands, events)
+        event_names = [event for event, _ in list(events.queue)]
+        self.assertIn("error", event_names)
+        self.assertNotIn("fallback", event_names)
+        self.assertIn(("duty", 1, interpolate(DEFAULT_CURVE, 60)), controller.calls)
+
+    def test_full_speed_is_applied_even_when_temperature_read_fails(self):
+        controller = FakeController()
+        controller.fail_read = True
+        commands, events = queue.Queue(), queue.Queue()
+        commands.put(("configure", settings("full", "full")))
+        commands.put(("shutdown", None))
+        with patch("clevo_fan_gui.FanController", return_value=controller):
+            controller_worker(commands, events)
+        self.assertIn(("duty", 1, 100), controller.calls)
+        self.assertIn(("duty", 2, 100), controller.calls)
 
 
 class PolicyTests(unittest.TestCase):
@@ -236,6 +325,38 @@ class GuiTests(unittest.TestCase):
         self.pump(lambda: bool(destroyed))
         self.assertEqual(json.loads(self.path.read_text())["fan_modes"]["1"], "curve")
         self.assertEqual(self.controller.calls[-2:], [("auto", 1), ("auto", 2)])
+
+    def stop_worker_for_events(self):
+        self.app.commands.put(("shutdown", None))
+        self.app.worker.join(3)
+        while not self.app.events.empty():
+            self.app.events.get_nowait()
+
+    def test_recovered_status_clears_old_error_and_handles_unknown_rpm(self):
+        self.stop_worker_for_events()
+        status = {**FanPolicy(2).snapshot(), **self.controller.status()}
+        self.app.events.put(("error", "test timeout"))
+        self.app.events.put(("status", status))
+        self.app.process_events()
+        self.assertIn("通信已恢复", self.app.status_label.cget("text"))
+        self.assertFalse(self.app.communication_error)
+        status["fans"][0]["rpm"] = None
+        status["warnings"] = ["CPU RPM 暂不可用"]
+        self.app.events.put(("status", status))
+        self.app.process_events()
+        self.assertIn("-- RPM", self.app.telemetry_labels[1].cget("text"))
+
+    def test_fallback_preserves_saved_choice_and_range_changes_are_saved(self):
+        self.stop_worker_for_events()
+        self.app.events.put(("fallback", {**FanPolicy(2).snapshot(), "restored": True}))
+        self.app.process_events()
+        self.assertEqual(self.app.active_modes[1], "automatic")
+        self.assertEqual(self.config.data["fan_modes"]["1"], "curve")
+        self.app.range_var.set("24 小时")
+        self.app.change_history_range()
+        stored = json.loads(self.path.read_text())
+        self.assertEqual(stored["history_range"], "24 小时")
+        self.assertEqual(stored["fan_modes"]["1"], "curve")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 1, 0),
-    prodvers=(1, 1, 1, 0),
+    filevers=(1, 2, 0, 0),
+    prodvers=(1, 2, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,12 +15,12 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'Clevo EC Fan Control contributors'),
          StringStruct('FileDescription', 'Direct EC fan control for verified Clevo-based laptops'),
-         StringStruct('FileVersion', '1.1.1'),
+         StringStruct('FileVersion', '1.2.0'),
          StringStruct('InternalName', 'ClevoEcFanControl'),
          StringStruct('LegalCopyright', 'Copyright (c) 2026 Clevo EC Fan Control contributors'),
          StringStruct('OriginalFilename', 'ClevoEcFanControl.exe'),
          StringStruct('ProductName', 'Clevo EC Fan Control'),
-         StringStruct('ProductVersion', '1.1.1')])
+         StringStruct('ProductVersion', '1.2.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

@@ -19,6 +19,7 @@ class AppConfig:
             "curves": {"1": DEFAULT_CURVE, "2": DEFAULT_CURVE},
             "manual_duties": {"1": 50, "2": 50},
             "history_metric": "温度 °C",
+            "history_range": "15 分钟",
             "mode": "automatic",
             "fan_modes": {"1": "automatic", "2": "automatic"},
             "shared_curve": DEFAULT_CURVE,
@@ -79,6 +80,8 @@ class AppConfig:
         metric = stored.get("history_metric")
         if metric in ("温度 °C", "转速 %", "RPM"):
             data["history_metric"] = metric
+        if stored.get("history_range") in ("3 分钟", "15 分钟", "1 小时", "6 小时", "24 小时"):
+            data["history_range"] = stored["history_range"]
         geometry = stored.get("window_geometry")
         if isinstance(geometry, str):
             if re.fullmatch(r"\d{3,5}x\d{3,5}[+-]\d{1,6}[+-]\d{1,6}", geometry):

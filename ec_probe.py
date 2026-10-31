@@ -7,7 +7,7 @@ EC_DATA = 0x62
 EC_COMMAND = 0x66
 EC_IBF = 0x02
 EC_OBF = 0x01
-TIMEOUT = 0.1
+TIMEOUT = 0.2
 
 
 class EmbeddedController:
@@ -36,7 +36,8 @@ class EmbeddedController:
             if (self.read_port(EC_COMMAND) & mask) == expected:
                 return
             time.sleep(0.0001)
-        raise TimeoutError(f"EC status timeout: mask=0x{mask:02X}, expected=0x{expected:02X}")
+        operation = "等待 EC 返回数据" if mask == EC_OBF else "等待 EC 接收命令"
+        raise TimeoutError(f"{operation}超时（mask=0x{mask:02X}, expected=0x{expected:02X}）")
 
     def send_command(self, command):
         time.sleep(0.005)

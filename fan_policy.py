@@ -29,9 +29,10 @@ class FanPolicy:
             validated[fan] = entry
         self.settings = validated
 
-    def update(self, controller):
+    def update(self, controller, readings=None):
         # Read every controlled sensor before writing any custom duty.
-        temperatures = {fan: controller.read_temperature_and_duty(fan)[0]
+        temperatures = {fan: (readings[fan] if readings is not None else
+                              controller.read_temperature_and_duty(fan))[0]
                         for fan, entry in self.settings.items() if entry["mode"] in ("curve", "manual")}
         for fan, temperature in temperatures.items():
             if not 10 <= temperature <= 110:

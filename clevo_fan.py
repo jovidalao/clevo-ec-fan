@@ -69,17 +69,31 @@ class FanController:
             time.sleep(0.02)
         raise RuntimeError(f"Could not read a consistent, valid temperature for fan {fan}")
 
-    def status(self):
+    def status(self, readings=None, *, tolerate_rpm_errors=False, read_rpm=True):
         fans = []
+        warnings = []
+        if not hasattr(self, "_rpm_cache"):
+            self._rpm_cache = {}
         for fan in range(1, self.fan_count + 1):
-            temperature, duty = self.read_temperature_and_duty(fan)
+            temperature, duty = (readings[fan] if readings is not None else
+                                 self.read_temperature_and_duty(fan))
+            if read_rpm:
+                try:
+                    self._rpm_cache[fan] = (self.ec.read_rpm(fan), None)
+                except (TimeoutError, OSError) as error:
+                    if not tolerate_rpm_errors:
+                        raise
+                    self._rpm_cache[fan] = (None, str(error))
+            rpm, error = self._rpm_cache.get(fan, (None, None))
+            if error:
+                warnings.append(f"风扇 {fan} RPM 暂不可用：{error}")
             fans.append({
                 "fan": fan,
                 "temperature_c": temperature,
                 "duty_percent": duty,
-                "rpm": self.ec.read_rpm(fan),
+                "rpm": rpm,
             })
-        return {"fans": fans}
+        return {"fans": fans, "warnings": warnings}
 
     def test(self):
         try:

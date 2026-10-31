@@ -1,13 +1,14 @@
 import argparse
 import ctypes
 import math
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import queue
 import sys
 import threading
 import time
 import tkinter as tk
-from collections import deque
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -20,6 +21,10 @@ from clevo_fan import DEFAULT_CURVE, FanController, acquire_mutex
 from fan_policy import FanPolicy, MODE_NAMES, EMERGENCY_TEMPERATURE, EMERGENCY_RELEASE_TEMPERATURE
 from platform_guard import compatibility_error, system_identity
 from version import APP_NAME, APP_VERSION
+from telemetry_history import HISTORY_RANGES, TelemetryHistory
+
+LOGGER = logging.getLogger("clevo_ec_fan")
+LOGGER.addHandler(logging.NullHandler())
 
 FAN_NAMES = {1: "风扇 1 · CPU", 2: "风扇 2 · GPU"}
 FAN_COLORS = {1: "#1971c2", 2: "#e8590c"}
@@ -33,11 +38,32 @@ def resource_path(relative):
 def controller_worker(commands, events):
     controller = None
     policy = None
+
+    def fallback(error):
+        failures = policy.restore_auto(controller)
+        shutdown_pending = False
+        while True:
+            try:
+                queued, _ = commands.get_nowait()
+                shutdown_pending |= queued == "shutdown"
+            except queue.Empty:
+                break
+        if shutdown_pending:
+            commands.put(("shutdown", None))
+        message = f"{error}；已恢复 EC 自动，保留原设置，可手动重新应用"
+        if failures:
+            message = f"{error}；恢复自动失败：" + "；".join(failures)
+        LOGGER.error(message)
+        events.put(("error", message))
+        events.put(("fallback", {**policy.snapshot(), "restored": not failures}))
+        return not failures
+
     try:
         controller = FanController()
         policy = FanPolicy(controller.fan_count)
+        policy.update(controller)
         events.put(("ready", controller.fan_count))
-        next_status = next_update = 0
+        next_sample = next_rpm = 0
         while True:
             try:
                 command, payload = commands.get(timeout=0.1)
@@ -45,45 +71,71 @@ def controller_worker(commands, events):
                 command, payload = None, None
             if command == "shutdown":
                 break
-            now = time.monotonic()
-            try:
-                if command == "configure":
+            if command == "configure":
+                try:
                     policy.configure(payload)
-                    next_status = next_update = 0
-                now = time.monotonic()
-                if now >= next_update:
-                    policy.update(controller)
-                    next_update = now + 2
-                if now >= next_status:
-                    events.put(("status", {**policy.snapshot(), **controller.status()}))
-                    next_status = now + 1.5
-            except Exception as error:
-                failures = policy.restore_auto(controller)
-                # Discard queued custom settings after a hardware failure.
-                shutdown_pending = False
-                while True:
+                    next_sample = 0
+                except (KeyError, ValueError, TypeError) as error:
+                    LOGGER.exception("Invalid controller configuration")
+                    events.put(("error", f"设置无效，未更改控制：{error}"))
+                # Automatic/full-speed recovery must work even without a sensor.
+                if all(entry["mode"] in ("automatic", "full") for entry in policy.settings.values()):
                     try:
-                        queued, _ = commands.get_nowait()
-                        shutdown_pending |= queued == "shutdown"
-                    except queue.Empty:
+                        policy.update(controller, readings={})
+                    except Exception as error:
+                        LOGGER.exception("EC automatic/full-speed command failed")
+                        if not fallback(error):
+                            break
+            now = time.monotonic()
+            if now < next_sample:
+                continue
+            try:
+                # One validated temperature sample serves both control and monitoring.
+                readings = {fan: controller.read_temperature_and_duty(fan)
+                            for fan in range(1, controller.fan_count + 1)}
+                sample_time = time.monotonic()
+            except Exception as error:
+                LOGGER.exception("EC temperature read failed")
+                controlled = any(entry["mode"] in ("curve", "manual")
+                                 for entry in policy.settings.values())
+                if controlled:
+                    if not fallback(error):
                         break
-                if shutdown_pending:
-                    commands.put(("shutdown", None))
-                events.put(("error", f"{error}；已尝试恢复 EC 自动" +
-                            ("；恢复失败：" + "；".join(failures) if failures else "")))
-                events.put(("fallback", policy.snapshot()))
-                if failures:
+                else:
+                    events.put(("error", f"温度读取暂不可用，2 秒后重试；当前控制保持不变：{error}"))
+                next_sample = time.monotonic() + 2
+                continue
+            try:
+                policy.update(controller, readings=readings)
+            except Exception as error:
+                LOGGER.exception("EC control write failed")
+                if not fallback(error):
                     break
-                next_status = now + 1.5
+                next_sample = time.monotonic() + 2
+                continue
+            try:
+                status = controller.status(readings=readings, tolerate_rpm_errors=True,
+                                           read_rpm=now >= next_rpm)
+                if now >= next_rpm:
+                    next_rpm = time.monotonic() + 6
+                    for warning in status.get("warnings", []):
+                        LOGGER.warning(warning)
+                events.put(("status", {**policy.snapshot(), **status, "sample_time": sample_time}))
+            except Exception as error:
+                # A telemetry-only error must never replace a valid control policy.
+                LOGGER.exception("EC monitor read failed")
+                events.put(("error", f"监控读取暂不可用，控制仍运行：{error}"))
+            next_sample = time.monotonic() + 2
     except Exception as error:
+        LOGGER.exception("EC worker failed")
         events.put(("fatal", str(error)))
     finally:
         if controller is not None:
-            fans = range(1, controller.fan_count + 1)
-            for fan in fans:
+            for fan in range(1, controller.fan_count + 1):
                 try:
                     controller.set_auto(fan)
                 except Exception as error:
+                    LOGGER.exception("Restoring EC automatic control failed")
                     events.put(("error", f"恢复自动控制失败：{error}"))
         events.put(("stopped", None))
 
@@ -107,7 +159,9 @@ class FanControlApp:
         self.curve_vars = {1: [], 2: []}
         self.curve_canvases = {}
         self.drag_target = None
-        self.history = {1: deque(maxlen=120), 2: deque(maxlen=120)}
+        self.history = TelemetryHistory()
+        self.communication_error = False
+        self.fallback_active = False
         self.close_requested = False
         self.last_status = None
         self.tray_icon = None
@@ -286,7 +340,13 @@ class FanControlApp:
                               values=("温度 °C", "转速 %", "RPM"))
         metric.pack(side="left", padx=8)
         metric.bind("<<ComboboxSelected>>", self.change_metric)
-        ttk.Label(toolbar, text="蓝色：CPU　橙色：GPU　最近约 3 分钟",
+        ttk.Label(toolbar, text="时间范围").pack(side="left", padx=(12, 0))
+        self.range_var = tk.StringVar(value=self.config.data["history_range"])
+        ranges = ttk.Combobox(toolbar, textvariable=self.range_var, state="readonly", width=9,
+                              values=tuple(HISTORY_RANGES))
+        ranges.pack(side="left", padx=8)
+        ranges.bind("<<ComboboxSelected>>", self.change_history_range)
+        ttk.Label(toolbar, text="蓝色：CPU　橙色：GPU",
                   foreground="#6c757d").pack(side="right")
         self.monitor_summary = ttk.Label(parent, text="等待传感器数据…", style="Telemetry.TLabel")
         self.monitor_summary.grid(row=1, column=0, sticky="w", pady=14)
@@ -294,6 +354,8 @@ class FanControlApp:
                                         highlightbackground="#dee2e6")
         self.history_canvas.grid(row=2, column=0, sticky="nsew")
         self.history_canvas.bind("<Configure>", lambda event: self.draw_history())
+        ttk.Label(parent, text="保留本次运行最近 24 小时 · 温度约 2 秒更新，RPM 约 6 秒更新 · 断线留空",
+                  foreground="#6c757d").grid(row=3, column=0, sticky="w", pady=(8, 0))
 
     def build_settings_tab(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -462,6 +524,7 @@ class FanControlApp:
             self.config.data["fan_modes"][str(fan)] = mode
         values = set(self.config.data["fan_modes"].values())
         self.config.data["mode"] = next(iter(values)) if len(values) == 1 else "mixed"
+        self.fallback_active = False
         self.save_preferences()
         self.send_policy()
 
@@ -484,6 +547,11 @@ class FanControlApp:
             for variable in self.fan_mode_vars.values():
                 variable.set(MODE_NAMES["automatic"])
 
+    def change_history_range(self, event=None):
+        self.config.data["history_range"] = self.range_var.get()
+        self.save_preferences()
+        self.draw_history()
+
     def change_metric(self, event=None):
         self.config.data["history_metric"] = self.metric_var.get()
         self.save_preferences()
@@ -495,6 +563,7 @@ class FanControlApp:
         self.config.data["link_curves"] = self.link_curves_var.get()
         self.config.data["link_manual"] = self.link_manual_var.get()
         self.config.data["history_metric"] = self.metric_var.get()
+        self.config.data["history_range"] = self.range_var.get()
         self.config.data["window_geometry"] = self.root.geometry()
         try:
             self.config.save()
@@ -584,27 +653,40 @@ class FanControlApp:
         canvas = self.history_canvas
         canvas.delete("all")
         width, height = max(canvas.winfo_width(), 500), max(canvas.winfo_height(), 300)
-        left, right, top, bottom = 58, 24, 28, 42
-        metric = self.metric_var.get()
-        key = {"温度 °C": "temperature_c", "转速 %": "duty_percent", "RPM": "rpm"}[metric]
+        left, right, top, bottom = 58, 24, 28, 50
+        key = {"温度 °C": "temperature_c", "转速 %": "duty_percent", "RPM": "rpm"}[self.metric_var.get()]
         maximum = 110 if key == "temperature_c" else 100 if key == "duty_percent" else 8000
+        duration = HISTORY_RANGES[self.range_var.get()]
+        end, wall_now = time.monotonic(), time.time()
         for step in range(6):
             value = round(maximum * step / 5)
             y = top + (maximum - value) / maximum * (height - top - bottom)
             canvas.create_line(left, y, width - right, y, fill="#e9ecef")
             canvas.create_text(left - 10, y, text=str(value), anchor="e", fill="#6c757d", font=("Consolas", 9))
+            x = left + step / 5 * (width - left - right)
+            canvas.create_line(x, top, x, height - bottom, fill="#f1f3f5")
+            age = duration * (1 - step / 5)
+            label = time.strftime("%H:%M:%S" if duration <= 900 else "%H:%M",
+                                  time.localtime(wall_now - age))
+            if step == 5:
+                label = "现在"
+            canvas.create_text(x, height - bottom + 19, text=label, fill="#6c757d", font=("Microsoft YaHei UI", 9))
+        any_points = False
         for fan in (1, 2):
-            entries = list(self.history[fan])
-            if len(entries) < 2:
-                continue
-            points = []
-            for index, entry in enumerate(entries):
-                x = left + index / 119 * (width - left - right)
-                value = min(maximum, entry[key])
-                y = top + (maximum - value) / maximum * (height - top - bottom)
-                points.append((x, y))
-            canvas.create_line(*points, fill=FAN_COLORS[fan], width=2)
-        canvas.create_text(left, 10, text=metric, anchor="w", fill="#495057")
+            segments = self.history.segments(fan, key, end, duration, int(width - left - right))
+            for segment in segments:
+                any_points = True
+                points = [(left + (timestamp - (end - duration)) / duration * (width - left - right),
+                           top + (maximum - max(0, min(maximum, value))) / maximum * (height - top - bottom))
+                          for timestamp, value in segment]
+                if len(points) > 1:
+                    canvas.create_line(*points, fill=FAN_COLORS[fan], width=2)
+                else:
+                    x, y = points[0]
+                    canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=FAN_COLORS[fan], outline="")
+        if not any_points:
+            canvas.create_text(width / 2, height / 2, text="等待有效数据…", fill="#6c757d")
+        canvas.create_text(left, 10, text=f"{self.metric_var.get()} · 最近 {self.range_var.get()}", anchor="w", fill="#495057")
 
     def setup_tray(self):
         image = Image.new("RGBA", (64, 64), (25, 113, 194, 255))
@@ -676,28 +758,39 @@ class FanControlApp:
                     self.mode_label.configure(text=mode)
                     if self.tray_icon is not None:
                         self.tray_icon.title = f"{APP_NAME} · {mode}"
+                    warnings = payload.get("warnings", [])
+                    if warnings:
+                        self.communication_error = True
+                        self.status_label.configure(text="温度控制正常 · " + "；".join(warnings))
+                    elif self.communication_error:
+                        self.communication_error = False
+                        message = "EC 通信已恢复"
+                        if self.fallback_active:
+                            message += " · 当前为 EC 自动；原设置已保留，点击应用曲线可重新启用"
+                        self.status_label.configure(text=message)
+                    self.history.append(payload.get("sample_time", time.monotonic()), payload["fans"])
                     summaries = []
                     for fan_data in payload["fans"]:
                         fan = fan_data["fan"]
-                        self.history[fan].append(fan_data)
+                        rpm_text = f"{fan_data['rpm']:4d}" if fan_data.get("rpm") is not None else "  --"
                         self.telemetry_labels[fan].configure(
-                            text=f"{fan_data['temperature_c']:2d} °C   {fan_data['rpm']:4d} RPM")
+                            text=f"{fan_data['temperature_c']:2d} °C   {rpm_text} RPM")
                         target = payload["targets"].get(fan)
                         suffix = f" · 目标 {target}%" if target is not None else ""
                         self.target_labels[fan].configure(text=f"EC 回报转速 {fan_data['duty_percent']}%{suffix}")
-                        summaries.append(f"{'CPU' if fan == 1 else 'GPU'} {fan_data['temperature_c']}°C / {fan_data['rpm']} RPM")
+                        summaries.append(f"{'CPU' if fan == 1 else 'GPU'} {fan_data['temperature_c']}°C / {rpm_text.strip()} RPM")
                     self.monitor_summary.configure(text="　　".join(summaries))
                     self.draw_history()
                 elif event == "error":
+                    self.communication_error = True
                     self.status_label.configure(text=f"错误：{payload}")
                 elif event == "fallback":
                     for fan, mode in payload["fan_modes"].items():
                         self.active_modes[fan] = mode
-                        self.config.data["fan_modes"][str(fan)] = mode
                         self.fan_mode_vars[fan].set(MODE_NAMES[mode])
-                    self.config.data["mode"] = payload["mode"]
-                    self.mode_label.configure(text="控制出错 · 已回退 EC 自动")
-                    self.save_preferences()
+                    self.fallback_active = payload.get("restored", True)
+                    self.mode_label.configure(text="控制出错 · 已回退 EC 自动" if self.fallback_active else
+                                              "控制出错 · 恢复自动失败")
                 elif event == "fatal":
                     self.status_label.configure(text=f"EC 连接失败：{payload}")
                     messagebox.showerror("EC 连接失败", payload, parent=self.root)
@@ -754,6 +847,16 @@ def main():
         root = tk.Tk()
         if args.background:
             root.withdraw()
+        try:
+            log_dir = AppConfig.load().path.parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(log_dir / "control.log", maxBytes=262144,
+                                          backupCount=2, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            LOGGER.addHandler(handler)
+            LOGGER.setLevel(logging.INFO)
+        except OSError:
+            pass
         app = FanControlApp(root)
         root.mainloop()
     finally:
